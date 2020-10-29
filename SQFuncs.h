@@ -20,7 +20,9 @@ extern "C" {
 	void					RegisterMyFuncs						(HSQUIRRELVM v);
 	int FirstMessageLength(unsigned char* message);
 	int countMessage(unsigned char* rmsg, int len);
-	
+	int IsPlayerActor(int32_t playerid);
+	int GetActorID(int32_t playerid); 
+	int GetActorSkin(int aid);
 #ifdef __cplusplus
 }
 #endif

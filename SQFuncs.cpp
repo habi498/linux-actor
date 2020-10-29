@@ -20,7 +20,7 @@ extern HSQAPI sq;
 extern HSQUIRRELVM v;
 bool debug = false;
 int id = 0;
-short int PORT = 8192;
+int PORT=8192;
 int FirstMessageLength(unsigned char* message)
 {
 	int payload = message[1] * 256 + message[2];
@@ -29,6 +29,7 @@ int FirstMessageLength(unsigned char* message)
 	else if (message[0] == 64)n = 3;
 	else if (message[0] == 0)n = 0;
 	else if (message[0] == 112)n = 17; // 7 + 4 + 2 + 4
+	else if (message[0] == 80)n = 13;// 3 + 4 + 2 + 4
 	else
 	{
 		return -1;
@@ -80,8 +81,16 @@ void encpld(int p, char* a, char* b)//encode payload
 void encodeIndex(int q, char* a, char* b, char* c)
 {
 	*a = q % 256;
-	*b = (q - q % 256) / 256;
-	*c = (q - q % 65536) / 65536;
+	*b = (q / 256) % 256;
+	*c = (q / 65536) % 256;
+}
+void encodeCind(unsigned int index, unsigned char* a,
+	unsigned char* b, unsigned char* c, unsigned char* d)
+{
+	*d = index % 256;
+	*c = (index / 256) % 256;
+	*b = (index / 65536) % 256;
+	*a = (index / (65536 * 256)) % 256;
 }
 void encodeCoord(float x, char* a, char* b, char* c, char* d)
 {
@@ -111,29 +120,47 @@ void encodeCoord(float x, char* a, char* b, char* c, char* d)
 	*d = floor(((y2 * 256 - floor(y2 * 256)) * 256 - (unsigned char)(*c)) * 256);
 
 }
+struct a8Data
+{
+	unsigned char wepid;
+	unsigned char killerid;
+	unsigned char bodypart;
+	bool anim = true;
+};
 class Actor
 {
 public:
 	char name[10];
-	char file[20];
+	char filename[31];
 	int clientId;//player.ID
 	int ConnectSocket = -1;
 	int psn;
 	int msi;//message sequnce index
-	int rel_mes_no;//reliable message number
+	unsigned int rel_mes_no;//reliable message number
+	int chat_mes_ord_ind = 0;
 	int guid; //also can be used actors[guid]
-	int skinId;//initial skin id. 
+	int skinId=-1;//initial skin id. 
 	bool pending = false;
 	bool pending2 = false;
 	float px = -232.0314, py = -442.6181, pz = 32.7944, angle = 0.0;
 	unsigned char health = 100; // 0 to 255
 	int cind = 2;//change index (?
 	char action = 0;
-	bool joined = false;
 	//01 for change in pos, 11 running, 10 walking
+	bool joined = false;
+	bool playing = false;//record and playing
+	bool filetoPlay = false;
+	unsigned int pind = 0;//cind while playing
+	char master = -1;//player who typed /play
+	bool pending3 = false;
+	a8Data death;
+	unsigned long a5tick = 0;
+	unsigned long pendingTrigger = 0;
+	bool spawning = false;
 	Actor()
 	{
-
+		for (int i = 0; i < 31; i++)
+			filename[i] = 0;
 	}
 	~Actor()
 	{
@@ -148,13 +175,199 @@ public:
 	void Connect();
 	void SendConnectedPong(unsigned char* packet);
 	void SendACK(char* recvbuf);
+	void SendPacket(unsigned char* packet, int len);
 	void Send93();
+	void Send93With09();
+	void Send93Withoutff();
+	void SendA5();
 	void SendA6();
 	void SendA7();
+	void SendA8();
+	void SendA9();
+
+	int channelFiveIndex = 2;
 	void encodeAngle(char* a, char* b);
 };
 
 Actor actors[512];
+bool DisconnectActor(char* name, int len)//len is length of name
+{
+	for (int i = 0; i < id; i++)
+	{
+		if (actors[i].joined == false)
+			continue;
+		for (int j = 0; j < len; j++)
+		{
+			if (actors[i].name[j] != name[j])
+			{
+				goto outer;
+			}
+			if (j == len - 1)
+			{
+				if (actors[i].name[len] == 0)
+				{
+					//printf("joined=false set for actor %d\n", i);
+					actors[i].skinId = -1;//first set skinid=-1
+					actors[i].joined = false;
+					actors[i].clientId = -1;
+					actors[i].playing = false;
+					for (int l = 0; l < 10; l++)
+						actors[i].name[l] = 0;
+					return true;
+				}
+			}
+		}
+	outer:
+		;
+	}
+	return false;
+}
+bool IsActorAvailable(int actorid)
+{
+	if (actors[actorid].joined == true &&
+		actors[actorid].playing == false)return true;
+	return false;
+}
+void BuyActor(int aid)
+{
+	actors[aid].playing = true;
+	actors[aid].pind = 0;
+}
+void FreeActor(int aid)
+{
+	actors[aid].playing = false;
+}
+bool IsActorDisconnected(int actorid)
+{
+	if (actors[actorid].joined == false)
+		return true;
+	return false;
+}
+void SendPacket(int actorid, unsigned char* packet, int plen)
+{
+	//printf("Send packet was called with len %d\n",plen);
+	actors[actorid].SendPacket(packet, plen);
+}
+void Actor::SendPacket(unsigned char* packet, int len)
+{
+	int len2 = len, m1, m2;
+	if (packet[0] == 132)//0x84
+	{
+		unsigned char* message = packet + 4;
+		char t = countMessage(message, len - 4);
+		for (int i = 0; i < t; i++)
+		{
+			if ((message[0] == 0 && message[3] == 0) ||
+				(message[0] == 64 && message[6] == 0) ||
+				(message[0] == 0 && message[3] == 3))//pong
+			{
+				//this is ping message. if we send it, it dec
+
+				if (t == 1)
+				{
+					//only one message !
+					//get the hell out of here
+					return;
+				}
+				else
+				{
+					len2 = len2 - FirstMessageLength(message);
+					if (i + 1 == t)
+					{
+						//nothing to do since this is last message
+					}
+					else
+					{
+						m1 = FirstMessageLength(message);
+						m2 = packet + len - message;
+						//eg. packet length is 100. ie.len=100
+						//message is packet+55;
+						//message[0]=packet[55];
+						//m2 =packet+len-message
+						//    = packet+100-message
+						//		= 45
+						//see how cunning i am
+						for (int j = 0; j + m1 < m2; j++)
+						{
+							message[j] = message[j + m1];
+						}
+						goto outer;
+					}
+				}
+			}
+			else
+				if (message[0] == 32)
+				{
+					encodeIndex(msi, (char*)&message[3],
+						(char*)&message[4], (char*)&message[5]);
+					msi++;
+					if (message[10] == 147 || //0x93
+						message[10] == 148 || //0x94
+						message[10] == 149 ||  //0x95
+						message[10] == 151) //0x97 ( vehicle sync
+					{
+						message[6] = 2;
+					}
+					unsigned int index;
+					if (message[10] == 147 ||
+						message[10] == 148 ||
+						message[10] == 149)
+					{		//0x93 or 0x94. 94 is shooting
+						index = message[11] * 65536 * 256 +
+							message[12] * 65536 +
+							message[13] * 256 +
+							message[14];
+
+						if (pind == 0)
+						{
+							pind = index;
+							encodeCind(cind, &message[11],
+								&message[12], &message[13],
+								&message[14]);
+						}
+						else {
+							cind += index - pind;
+							pind = index;
+							encodeCind(cind, &message[11],
+								&message[12], &message[13],
+								&message[14]);
+						}
+					}
+				}
+				else if (message[0] == 64 ||
+					message[0] == 96)//0x40 or 0x60 
+				{
+					encodeIndex(rel_mes_no, (char*)&message[3],
+						(char*)&message[4], (char*)&message[5]);
+					rel_mes_no++;
+					if (message[0] == 96 && message[10] == 0xa2)
+					{
+						//chat message
+						encodeIndex(chat_mes_ord_ind,
+							(char*)&message[6], (char*)&message[7],
+							(char*)&message[8]);
+						chat_mes_ord_ind++;
+					}
+				}
+			message = message + FirstMessageLength(message);
+		outer:
+			;
+		}
+		encodeIndex(psn, (char*)&packet[1], (char*)&packet[2],
+			(char*)&packet[3]);
+		psn++;
+		if (len != len2)
+		{
+			//printf("len2 not equal\n");
+			//for (int k = 0; k < len2; k++)
+				//printf("%d ", packet[k]);
+			//printf("\n");
+		}
+		if (len2 > 4)
+			send(ConnectSocket, (char*)packet, len2, 0);
+	}
+}
+
 void Actor::SendACK(char* recvbuf)
 {
 	unsigned char* ack;
@@ -231,6 +444,24 @@ void Actor::SendConnectedPong(unsigned char* packet)
 	d = NULL;
 	psn += 1;
 }
+void Actor::SendA5()
+{
+	char pkt[16];
+	pkt[0] = 132;
+	encodeIndex(psn, &pkt[1], &pkt[2], &pkt[3]);
+	psn++;
+	pkt[4] = 96;//reliability;
+	encpld(16, &pkt[5], &pkt[6]);//PAYLOAD
+	encodeIndex(rel_mes_no, &pkt[7], &pkt[8], &pkt[9]);//message seq. indx.
+	rel_mes_no++;
+	encodeIndex(channelFiveIndex, &pkt[10], &pkt[11], &pkt[12]);//ordering index
+	channelFiveIndex++;
+	pkt[13] = 5;//ordering channel
+	pkt[14] = 165;//0xa5
+	pkt[15] = 0;
+	int iResult = send(ConnectSocket, pkt, sizeof(pkt), 0);
+
+}
 void Actor::SendA6()
 {
 	char pkt[15];
@@ -241,7 +472,8 @@ void Actor::SendA6()
 	encpld(8, &pkt[5], &pkt[6]);//PAYLOAD
 	encodeIndex(rel_mes_no, &pkt[7], &pkt[8], &pkt[9]);//message seq. indx.
 	rel_mes_no++;
-	encodeIndex(1, &pkt[10], &pkt[11], &pkt[12]);//ordering index
+	encodeIndex(channelFiveIndex, &pkt[10], &pkt[11], &pkt[12]);//ordering index
+	channelFiveIndex++;
 	pkt[13] = 5;//ordering channel
 	pkt[14] = 166;//0xa6
 	int iResult = send(ConnectSocket, pkt, sizeof(pkt), 0);
@@ -257,6 +489,58 @@ void Actor::SendA7()
 	encodeIndex(rel_mes_no, &pkt[7], &pkt[8], &pkt[9]);//message seq. indx.
 	rel_mes_no++;
 	pkt[10] = 167;//0xa7
+	int iResult = send(ConnectSocket, pkt, sizeof(pkt), 0);
+}
+void Actor::SendA8()
+{
+	char pkt[14];
+	pkt[0] = 132;
+	encodeIndex(psn, &pkt[1], &pkt[2], &pkt[3]);
+	psn++;
+	pkt[4] = 64;//reliability;
+	encpld(4 * 8, &pkt[5], &pkt[6]);//PAYLOAD
+	encodeIndex(rel_mes_no, &pkt[7], &pkt[8], &pkt[9]);//message seq. indx.
+	rel_mes_no++;
+	pkt[10] = 168;//0xa8
+	pkt[11] = death.wepid;
+	pkt[12] = death.killerid;
+	pkt[13] = death.bodypart;
+	int iResult = send(ConnectSocket, pkt, sizeof(pkt), 0);
+	a5tick = gettickcount();
+}
+void Actor::SendA9()
+{
+	char pkt[13];
+	pkt[0] = 132;
+	encodeIndex(psn, &pkt[1], &pkt[2], &pkt[3]);
+	psn++;
+	pkt[4] = 64;//reliability;
+	encpld(3 * 8, &pkt[5], &pkt[6]);//PAYLOAD
+	encodeIndex(rel_mes_no, &pkt[7], &pkt[8], &pkt[9]);//message seq. indx.
+	rel_mes_no++;
+	pkt[10] = 169;//0xa9
+	unsigned char bpt = death.bodypart;
+	if (bpt == 0)return;
+	if (bpt == 6) {
+		pkt[11] = 2; pkt[12] = 17; //head, anim id 17
+	}
+	else if (bpt == 1) {
+		pkt[11] = 1; pkt[12] = 13;
+	}
+	else if (bpt == 2) {
+		pkt[11] = 3; pkt[12] = 19;
+	}
+	else if (bpt == 3) {
+		pkt[11] = 4; pkt[12] = 20;
+	}
+	else if (bpt == 4) {
+		pkt[11] = 7; pkt[12] = 21;
+	}
+	else if (bpt == 5) {
+		pkt[11] = 8; pkt[12] = 22;
+	}
+	else return;
+
 	int iResult = send(ConnectSocket, pkt, sizeof(pkt), 0);
 }
 void Actor::Send93()
@@ -283,7 +567,56 @@ void Actor::Send93()
 	pkt[35] = 3;
 	int iResult = send(ConnectSocket, pkt, sizeof(pkt), 0);
 }
-
+void Actor::Send93With09()
+{
+	char pkt[40];
+	pkt[0] = 132;
+	encodeIndex(psn, &pkt[1], &pkt[2], &pkt[3]);
+	psn++;
+	pkt[4] = 32;//reliability;
+	encpld(26 * 8, &pkt[5], &pkt[6]);//PAYLOAD
+	encodeIndex(msi, &pkt[7], &pkt[8], &pkt[9]);//message seq. indx.
+	msi++;
+	encodeIndex(2, &pkt[10], &pkt[11], &pkt[12]);//ordering index
+	pkt[13] = 0;//ordering channel
+	pkt[14] = 147;//0x93
+	pkt[15] = 0;
+	encodeIndex(cind, &pkt[18], &pkt[17], &pkt[16]);
+	pkt[19] = 9;
+	encodeCoord(px, &pkt[20], &pkt[21], &pkt[22], &pkt[23]);
+	encodeCoord(py, &pkt[24], &pkt[25], &pkt[26], &pkt[27]);
+	encodeCoord(pz, &pkt[28], &pkt[29], &pkt[30], &pkt[31]);
+	encodeAngle(&pkt[32], &pkt[33]);
+	pkt[34] = 127;
+	pkt[35] = 255;
+	pkt[36] = 127;
+	pkt[37] = 255;
+	pkt[38] = 127;
+	pkt[39] = 255;
+	int iResult = send(ConnectSocket, pkt, sizeof(pkt), 0);
+}
+void Actor::Send93Withoutff()
+{
+	char pkt[34];
+	pkt[0] = 132;
+	encodeIndex(psn, &pkt[1], &pkt[2], &pkt[3]);
+	psn++;
+	pkt[4] = 32;//reliability;
+	encpld(20 * 8, &pkt[5], &pkt[6]);//PAYLOAD
+	encodeIndex(msi, &pkt[7], &pkt[8], &pkt[9]);//message seq. indx.
+	msi++;
+	encodeIndex(2, &pkt[10], &pkt[11], &pkt[12]);//ordering index
+	pkt[13] = 0;//ordering channel
+	pkt[14] = 147;//0x93
+	pkt[15] = 0;
+	encodeIndex(cind, &pkt[18], &pkt[17], &pkt[16]);
+	pkt[19] = 8;
+	encodeCoord(px, &pkt[20], &pkt[21], &pkt[22], &pkt[23]);
+	encodeCoord(py, &pkt[24], &pkt[25], &pkt[26], &pkt[27]);
+	encodeCoord(pz, &pkt[28], &pkt[29], &pkt[30], &pkt[31]);
+	encodeAngle(&pkt[32], &pkt[33]);
+	int iResult = send(ConnectSocket, pkt, sizeof(pkt), 0);
+}
 void Actor::encodeAngle(char* a, char* b)
 {
 	int val = floor(angle * 4096 * 4 / PI + 32767);
@@ -437,7 +770,7 @@ void Actor::Connect()
 	send(ConnectSocket, sendbuf15, sizeof(sendbuf15) - 1, 0);
 	send(ConnectSocket, sendbuf16, sizeof(sendbuf16) - 1, 0);
 	send(ConnectSocket, sendbuf17, sizeof(sendbuf17) - 1, 0);
-	send(ConnectSocket, sendbuf18, sizeof(sendbuf18), 0);
+	send(ConnectSocket, sendbuf18, sizeof(sendbuf18) - 1, 0);
 	psn = 10;
 	msi = 1;
 	rel_mes_no = 8;
@@ -452,15 +785,43 @@ void Actor::Connect()
 	do {
 		if (pending == true)
 		{
-			Send93();
-			pending = false;
+			if (gettickcount() > pendingTrigger)
+			{
+				Send93();
+				if (spawning == true)
+				{
+					spawning = false;
+					pendingTrigger = gettickcount() + 600;
+				}
+				else
+					pending = false;
+			}
 		}
 		if (pending2 == true)
 		{
-			SendA6();
-			SendA7();
-			pending2 = false;
-			pending = true;
+
+			if (gettickcount() - a5tick > 400)
+			{
+				SendA5();
+				SendA6();
+				SendA7();
+				pending2 = false;
+				cind += 2;
+				pendingTrigger = gettickcount() + 850;
+				spawning = true;
+				pending = true;
+
+			}
+		}
+		if (pending3 == true)
+		{
+			if (death.anim == true)
+				SendA9();
+			Send93Withoutff();
+			Send93With09();
+			SendA8();
+			pending3 = false;
+			health = 100;
 		}
 		iResult = recv(ConnectSocket, recvbuf, recvbuflen, 0);
 		if (iResult > 0)
@@ -490,7 +851,7 @@ void Actor::Connect()
 							{
 								joined = true;
 							}
-							else printf("Setting skin failed\n");
+							else printf("");//Setting skin failed
 						}
 
 						else joined = true;
@@ -648,14 +1009,86 @@ _SQUIRRELDEF(SQ_set_actor_angle) {
 	sq->pushbool(v, SQFalse);
 	return 1;
 }
+_SQUIRRELDEF(SQ_kill_actor) {
+	SQInteger iArgCount = sq->gettop(v);
+	if (iArgCount == 2) {
+		SQInteger a;
+		sq->getinteger(v, 2, &a);//actor id
+		actors[a].death.wepid = 44;//felled to death
+		actors[a].death.killerid = 255;
+		actors[a].death.bodypart = 0;
+		actors[a].death.anim = true;
+		actors[a].pending3 = true;
+		sq->pushinteger(v, 1);
+		return 1;
+	}
+	if (iArgCount == 3) {
+		SQInteger a;
+		sq->getinteger(v, 2, &a);//actor id
+		SQInteger b;
+		sq->getinteger(v, 3, &b);//reason
+		actors[a].death.wepid = b;
+		actors[a].death.killerid = 255;
+		actors[a].death.bodypart = 0;
+		actors[a].death.anim = true;
+		actors[a].pending3 = true;
+		sq->pushinteger(v, 1);
+		return 1;
+	}
+	if (iArgCount == 5) {
+		SQInteger a;
+		sq->getinteger(v, 2, &a);//actor id
+		SQInteger b;
+		sq->getinteger(v, 3, &b);//weapon id
+		SQInteger c;
+		sq->getinteger(v, 4, &c);//killer id
+		SQInteger d;
+		sq->getinteger(v, 5, &d);//body part
+		actors[a].death.wepid = b;
+		actors[a].death.killerid = c;
+		actors[a].death.bodypart = d;
+		actors[a].death.anim = true;
+		actors[a].pending3 = true;
+		sq->pushinteger(v, 1);
+		return 1;
+	}
+	if (iArgCount == 6) {
+		SQInteger a;
+		sq->getinteger(v, 2, &a);//actor id
+		SQInteger b;
+		sq->getinteger(v, 3, &b);//weapon id
+		SQInteger c;
+		sq->getinteger(v, 4, &c);//killer id
+		SQInteger d;
+		sq->getinteger(v, 5, &d);//body part
+		SQBool e;
+		sq->getbool(v, 6, &e);
+		if (e == SQFalse)actors[a].death.anim = false;
+		else actors[a].death.anim = true;
+		actors[a].death.wepid = b;
+		actors[a].death.killerid = c;
+		actors[a].death.bodypart = d;
+		actors[a].pending3 = true;
+		sq->pushinteger(v, 1);
+		return 1;
+	}
+	sq->pushbool(v, SQFalse);
+	return 1;
+}
 _SQUIRRELDEF(SQ_spawn_actor) {
 	SQInteger iArgCount = sq->gettop(v);
 	if (iArgCount == 2) {
 		SQInteger a;
 		sq->getinteger(v, 2, &a);//actor id
-		actors[a].pending2 = true;
-		sq->pushinteger(v, 1);
-		return 1;
+		uint8_t spawned = VCMP->IsPlayerSpawned(actors[a].clientId);
+		if (spawned == 0)
+		{
+			if (actors[a].health != 100)
+				actors[a].health = 100;
+			actors[a].pending2 = true;
+			sq->pushinteger(v, 1);
+			return 1;
+		}
 	}
 	sq->pushbool(v, SQFalse);
 	return 1;
@@ -696,25 +1129,246 @@ _SQUIRRELDEF(SQ_send_cmd) {
 	sq->pushbool(v, SQFalse);
 	return 1;
 }
-_SQUIRRELDEF(SQ_set_port) {
+
+void* playactor(void* pointer)
+{
+	Actor* t = (Actor*)pointer;
+	FILE* ptr;
+	unsigned char buffer[6];
+	ptr = fopen(t->filename, "rb");  // r for read, b for binary
+	if (ptr == NULL)
+	{
+		printf("Error in opening file.\n");
+		return 0;
+	}
+	unsigned long tick0 = NULL;
+	int actorid = t->guid;
+	if (t->master != -1)VCMP->SendClientMessage(t->master, 0xFFFFFF,
+		"Playing started");
+	if (t->playing == false)
+		t->playing = true;
+	t->pind = 0;
+	while (true)
+	{
+		fread(buffer, sizeof(buffer), 1, ptr);
+		unsigned long int tick =
+			buffer[0] * 65536 * 256 +
+			buffer[1] * 65536 +
+			buffer[2] * 256 +
+			buffer[3];
+		if (tick0 == NULL)tick0 = tick;
+		int plen = buffer[4] * 256 + buffer[5];
+		if (plen == 0)break;
+		unsigned char* packet;
+		packet = new unsigned char[plen];
+		// p len means packet len
+		fread(packet, plen, 1, ptr);
+	
+		struct timespec ts;
+		ts.tv_sec = (tick - tick0) / 1000;
+		ts.tv_nsec = ((tick - tick0)% 1000) * 1000000;
+		nanosleep(&ts,NULL);
+
+		tick0 = tick;
+		if (IsActorDisconnected(actorid))
+		{
+			printf("Interupted playing.\n");
+			if (t->master != -1)
+			{
+				VCMP->SendClientMessage(t->master, 0xFFFFFF,
+					"Playing Interrupted.");
+				t->master = -1;
+			}
+			delete[] packet;
+			packet = NULL;
+			fclose(ptr);
+			return 0;
+		}
+		SendPacket(actorid, packet, plen);
+		delete[] packet;
+		packet = NULL;
+	}
+	FreeActor(actorid);
+	fclose(ptr);
+	t->pind = 0;
+	if (t->master != -1)
+	{
+		VCMP->SendClientMessage(t->master, 0xFFFFFF,
+			"Finished playing");
+		t->master = -1;
+	}
+	int top = sq->gettop(v);
+	sq->pushroottable(v);
+	sq->pushstring(v, _SC("onPlayingCompleted"), -1);
+	if (SQ_SUCCEEDED(sq->get(v, -2))) {
+		sq->pushroottable(v);
+		sq->pushstring(v, t->filename, -1);
+		sq->pushinteger(v, actorid);
+		sq->call(v, 3, 0, 0);
+	}
+	sq->settop(v, top);
+}
+
+_SQUIRRELDEF(SQ_Read) {
+	SQInteger iArgCount = sq->gettop(v);
+	if (iArgCount == 3) {
+		const SQChar* name;
+		sq->getstring(v, 2, &name);
+
+		SQInteger actorid;
+		sq->getinteger(v, 3, &actorid);
+		if (IsActorAvailable(actorid))
+		{
+			BuyActor(actorid);
+		}
+		else {
+			printf("Actor %d not available.\n", actorid);
+			return 0;
+		}
+		if (strlen(name) > 30)
+		{
+			printf("Filename too long\n");
+			return 0;
+		}
+		for (int k = 0; k < strlen(name); k++)
+		{
+			actors[actorid].filename[k] = name[k];
+		}
+		for (int k = strlen(name); k < 31; k++)
+		{
+			actors[actorid].filename[k] = 0;
+		}
+		pthread_t thread1;
+		pthread_create(&thread1, NULL, playactor, (void*)&actors[actorid]);
+
+		sq->pushbool(v, SQTrue);
+		return 1;
+	}
+	else printf("Usage: PlayFile(john,actorid)\n");
+}
+_SQUIRRELDEF(SQ_IsActor) {
 	SQInteger iArgCount = sq->gettop(v);
 	if (iArgCount == 2) {
-		SQInteger port;
-		sq->getinteger(v, 2, &port);
-		if (port>=0 and port<=65536)
+		SQInteger playerid;
+		sq->getinteger(v, 2, &playerid);
+		char buffer[45];
+		int i = VCMP->GetPlayerName(playerid, buffer, 45);
+		if (i != 0)return 0;//wrong player id
+		for (int i = 0; i < id; i++)
 		{
-			PORT = port;
-			printf("Port set to %d\n", PORT);
-			sq->pushinteger(v, 1);
+			if (actors[i].joined == true &&
+				actors[i].clientId == playerid)
+			{
+				sq->pushbool(v, SQTrue);
+				return 1;
+			}
+		}
+		sq->pushbool(v, SQFalse);
+		return 1;
+	}
+	return 0;
+}
+int IsPlayerActor(int32_t playerid)
+{
+	char buffer[45];
+	int i = VCMP->GetPlayerName(playerid, buffer, 45);
+	if (i != 0)return 0;//wrong player id
+	for (int i = 0; i < id; i++)
+	{
+		if (actors[i].joined == true &&
+			actors[i].clientId == playerid)
+		{
 			return 1;
 		}
-		else
-			printf("Error. Usage:set_port(8193)\n");
-
 	}
-	sq->pushbool(v, SQFalse);
-	return 1;
+	return 0;
 }
+int GetActorSkin(int aid)
+{
+	return actors[aid].skinId;
+}
+int GetActorID(int32_t playerid)
+{
+	char buffer[45];
+	int i = VCMP->GetPlayerName(playerid, buffer, 45);
+	if (i != 0)return -1;//wrong player id
+	for (int i = 0; i < id; i++)
+	{
+		if (actors[i].joined == true &&
+			actors[i].clientId == playerid)
+		{
+			return i;
+		}
+	}
+	return -1;
+}
+_SQUIRRELDEF(SQ_GetActorID) {
+	SQInteger iArgCount = sq->gettop(v);
+	if (iArgCount == 2) {
+		SQInteger playerid;
+		sq->getinteger(v, 2, &playerid);
+		char buffer[45];
+		int i = VCMP->GetPlayerName(playerid, buffer, 45);
+		if (i != 0)return 0;//wrong player id
+		for (int i = 0; i < id; i++)
+		{
+			if (actors[i].joined == true &&
+				actors[i].clientId == playerid)
+			{
+				sq->pushinteger(v, i);
+				return 1;
+			}
+		}
+		return 0;
+	}
+	return 0;
+}
+_SQUIRRELDEF(SQ_UpdateHealth) {
+	SQInteger iArgCount = sq->gettop(v);
+	if (iArgCount == 3) {
+		SQInteger aid;
+		sq->getinteger(v, 2, &aid);
+		if (aid > id)return 0;
+		if (actors[aid].joined == true)
+		{
+			SQInteger health;
+			sq->getinteger(v, 3, &health);
+			actors[aid].health = (unsigned char)health;
+			actors[aid].pending = true;
+			return 0;
+		}
+	}
+}
+
+_SQUIRRELDEF(SQ_UpdateCoord) {
+	SQInteger iArgCount = sq->gettop(v);
+	if (iArgCount == 5) {
+		SQInteger aid;
+		sq->getinteger(v, 2, &aid);
+		if (aid > id)return 0;
+		if (actors[aid].joined == true)
+		{
+			sq->getfloat(v, 3, &actors[aid].px);
+			sq->getfloat(v, 4, &actors[aid].py);
+			sq->getfloat(v, 5, &actors[aid].pz);
+			return 0;
+		}
+	}
+}
+
+_SQUIRRELDEF(SQ_GetPlayerID) {
+	SQInteger iArgCount = sq->gettop(v);
+	if (iArgCount == 2) {
+		SQInteger aid;
+		sq->getinteger(v, 2, &aid);
+		if (actors[aid].joined == true)
+		{
+			sq->pushinteger(v, actors[aid].clientId);
+			return 1;
+		}
+	}
+}
+
 _SQUIRRELDEF(SQ_debug) {
 	SQInteger iArgCount = sq->gettop(v);
 	if (iArgCount == 2) {
@@ -743,14 +1397,20 @@ SQInteger RegisterSquirrelFunc(HSQUIRRELVM v, SQFUNCTION f, const SQChar* fname,
 	sq->setnativeclosurename(v, -1, fname);
 	sq->newslot(v, -3, SQFalse);
 	sq->pop(v, 1);
-
 	return 0;
 }
 void RegisterMyFuncs(HSQUIRRELVM v) {
 	RegisterSquirrelFunc(v, SQ_create_actor, "create_actor", 0, 0);
 	RegisterSquirrelFunc(v, SQ_set_actor_angle, "set_actor_angle", 0, 0);
+	RegisterSquirrelFunc(v, SQ_kill_actor, "kill_actor", 0, 0); 
 	RegisterSquirrelFunc(v, SQ_spawn_actor, "spawn_actor", 0, 0);
-	RegisterSquirrelFunc(v, SQ_set_port, "set_port", 0, 0);
 	RegisterSquirrelFunc(v, SQ_send_cmd, "send_cmd", 0, 0);
 	RegisterSquirrelFunc(v, SQ_debug, "debug", 0, 0);
+	RegisterSquirrelFunc(v, SQ_Read, "PlayFile", 0, 0);
+	RegisterSquirrelFunc(v, SQ_GetPlayerID, "GetPlayerIDActor", 0, 0);
+	RegisterSquirrelFunc(v, SQ_IsActor, "IsActor", 0, 0);
+	RegisterSquirrelFunc(v, SQ_GetActorID, "GetActorID", 0, 0);
+	RegisterSquirrelFunc(v, SQ_UpdateCoord, "correct_actor_pos", 0, 0);
+	RegisterSquirrelFunc(v, SQ_UpdateHealth, "set_actor_health", 0, 0);
+
 }

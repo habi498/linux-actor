@@ -7,7 +7,7 @@
 PluginFuncs* VCMP;
 HSQUIRRELVM v;
 HSQAPI sq;
-
+extern int PORT;
 // Attaching plugin's load to the squirrel VM
 void LoadSquirrelScript() {
 	// See if we have any imports from Squirrel
@@ -41,6 +41,13 @@ void LoadSquirrelScript() {
 
 // Called when server is loading the plugin
 uint8_t OnServerInitialise() {
+	ServerSettings c;
+	VCMP->GetServerSettings(&c);
+	if (c.port != PORT)
+	{
+		printf("Setting port to %d\n", c.port);
+		PORT = c.port;
+	}
 	OutputMessage("Loaded actorplus module..");
 	return 1;
 }
@@ -63,19 +70,60 @@ uint8_t OnPluginCommand(uint32_t type, const char* text) {
 
 	return 1;
 }
+void onPlayerDeath(int32_t playerid, int32_t killerid, int32_t reason,
+	vcmpBodyPart)
+{
+	if (IsPlayerActor(playerid) == 1)
+	{
+		int aid = GetActorID(playerid);
+		if (aid != -1)
+		{
+			int top = sq->gettop(v);
+			sq->pushroottable(v);
+			sq->pushstring(v, _SC("onActorDeath"), -1);
+			if (SQ_SUCCEEDED(sq->get(v, -2))) {
+				sq->pushroottable(v);
+				sq->pushinteger(v, aid);
+				sq->call(v, 2, 0, 0);
+			}
+			sq->settop(v, top);
+		}
+	}
+}
+void onPlayerSpawn(int32_t playerid)
+{
+	if (IsPlayerActor(playerid))
+	{
+		int aid = GetActorID(playerid);
+		if (aid != -1)
+		{
+			int skinId = GetActorSkin(aid);
+			if (skinId != -1)
+			{
+				VCMP->SetPlayerSkin(playerid, skinId);
+			}
+		}
+	}
+}
 
+void onPlayerUpdate(int32_t playerid, vcmpPlayerUpdate u)
+{
+	//u.
+}
 extern "C" unsigned int VcmpPluginInit(PluginFuncs* pluginFuncs, PluginCallbacks* pluginCalls, PluginInfo* pluginInfo) {
 	VCMP = pluginFuncs;
-
+	
 	// Plugin information
 	pluginInfo->pluginVersion = 0x110;
 	pluginInfo->apiMajorVersion = PLUGIN_API_MAJOR;
 	pluginInfo->apiMinorVersion = PLUGIN_API_MINOR;
 	strcpy(pluginInfo->name, "actor");
-
 	pluginCalls->OnServerInitialise = OnServerInitialise;
 	pluginCalls->OnServerShutdown = OnServerShutdown;
 	pluginCalls->OnPluginCommand = OnPluginCommand;
+	pluginCalls->OnPlayerSpawn = onPlayerSpawn;
+	pluginCalls->OnPlayerDeath = onPlayerDeath;
+	
 	return 1;
 }
 
